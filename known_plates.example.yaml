@@ -1,0 +1,8 @@
+# /data/known_plates.yaml
+# Map of license plate -> driver name. Plates are matched case-insensitively
+# and stripped of spaces/dashes, so "AB-123-CD", "ab 123 cd" and "AB123CD"
+# are all equivalent.
+
+AB123CD: Stefan
+EF456GH: Robin's mum
+XY789ZZ: Grandma
