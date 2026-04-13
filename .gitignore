@@ -1,0 +1,5 @@
+.env
+known_plates.yaml
+__pycache__/
+*.pyc
+.venv/
