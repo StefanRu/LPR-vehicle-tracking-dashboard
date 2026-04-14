@@ -51,6 +51,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import yaml
+import aiohttp
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -167,12 +168,44 @@ class ProtectState:
     async def connect(self) -> None:
         log.info("connecting to Protect at %s:%s as %s",
                  PROTECT_HOST, PROTECT_PORT, PROTECT_USERNAME)
+
+        # Build our own aiohttp session with a browser User-Agent.
+        #
+        # Some UDM firmwares (observed on newer builds) reject non-browser
+        # User-Agents on /api/auth/login with a 403, as a bot-protection
+        # measure. uiprotect's default UA ("Python/3.x aiohttp/3.x") trips
+        # this; curl with its default UA does not. Passing our own session
+        # lets us override it.
+        #
+        # We also relax TLS because UDM ships with a self-signed cert.
+        ssl_ctx = False if not PROTECT_VERIFY_SSL else None
+        connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+        custom_session = aiohttp.ClientSession(
+            connector=connector,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0.0.0 Safari/537.36"
+                ),
+            },
+        )
+
         client = ProtectApiClient(
             host=PROTECT_HOST,
             port=PROTECT_PORT,
             username=PROTECT_USERNAME,
             password=PROTECT_PASSWORD,
             verify_ssl=PROTECT_VERIFY_SSL,
+            session=custom_session,
+            # Disable session caching. With it on (the default), uiprotect
+            # persists the TOKEN cookie to disk and reloads it into the
+            # aiohttp cookie jar on every startup. Re-POSTing to
+            # /api/auth/login with a stale Cookie header makes some UDM
+            # firmwares reject the request with 403 (observed on
+            # eastparkserver). We'd rather pay the cost of a fresh login
+            # on every app start than deal with poisoned cached cookies.
+            store_sessions=False,
         )
         try:
             # update() logs in, fetches bootstrap, starts the websocket.
@@ -183,6 +216,11 @@ class ProtectState:
             import time as _t
             self._last_failure_ts = _t.monotonic()
             self._last_failure_msg = str(e)
+            # Close the session we just made so we don't leak sockets.
+            try:
+                await custom_session.close()
+            except Exception:
+                pass
             raise
         self.client = client
         self._last_failure_ts = 0.0
