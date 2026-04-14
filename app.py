@@ -144,11 +144,25 @@ def load_known_plates() -> dict[str, str]:
 # State is stashed on `app.state` so the request handlers can reach it.
 # --------------------------------------------------------------------------- #
 class ProtectState:
-    """Small holder for the live Protect client + derived camera map."""
+    """Small holder for the live Protect client + derived camera map.
+
+    Also enforces a minimum interval between reconnection attempts so that
+    a failing auth config doesn't get retried on every request. The UDM's
+    login endpoint has a rate limiter and we must not get stuck in a loop
+    that triggers it.
+    """
+
+    # Minimum seconds between reconnect attempts after a failure.
+    # The UDM returns 429 "Too Many Requests" after ~5 failed logins in
+    # quick succession, and the ban window is a few minutes. 60s of
+    # back-off between attempts keeps us comfortably under that.
+    RECONNECT_COOLDOWN_S = 60
 
     def __init__(self) -> None:
         self.client: ProtectApiClient | None = None
         self.camera_names: dict[str, str] = {}
+        self._last_failure_ts: float = 0.0
+        self._last_failure_msg: str = ""
 
     async def connect(self) -> None:
         log.info("connecting to Protect at %s:%s as %s",
@@ -160,9 +174,19 @@ class ProtectState:
             password=PROTECT_PASSWORD,
             verify_ssl=PROTECT_VERIFY_SSL,
         )
-        # update() logs in, fetches bootstrap, starts the websocket.
-        await client.update()
+        try:
+            # update() logs in, fetches bootstrap, starts the websocket.
+            await client.update()
+        except Exception as e:
+            # Mark the failure time so ensure_connected() won't try again
+            # for at least RECONNECT_COOLDOWN_S seconds.
+            import time as _t
+            self._last_failure_ts = _t.monotonic()
+            self._last_failure_msg = str(e)
+            raise
         self.client = client
+        self._last_failure_ts = 0.0
+        self._last_failure_msg = ""
         self._refresh_camera_map()
         log.info("connected; %d cameras in bootstrap", len(self.camera_names))
 
@@ -172,6 +196,14 @@ class ProtectState:
                 cam.id: cam.name or cam.id
                 for cam in self.client.bootstrap.cameras.values()
             }
+
+    def cooldown_remaining(self) -> float:
+        """Seconds remaining in the reconnect back-off. 0 if ready to try."""
+        if self._last_failure_ts == 0.0:
+            return 0.0
+        import time as _t
+        elapsed = _t.monotonic() - self._last_failure_ts
+        return max(0.0, self.RECONNECT_COOLDOWN_S - elapsed)
 
     async def close(self) -> None:
         if self.client is not None:
@@ -365,14 +397,24 @@ def format_row(row: dict) -> dict:
 # Connection resilience
 # --------------------------------------------------------------------------- #
 async def ensure_connected() -> None:
-    """If the initial connect failed or the session was lost, reconnect.
-    Called at the start of every event-fetching request."""
+    """If the initial connect failed or the session was lost, reconnect —
+    but respect the back-off window so we don't hammer Protect's login
+    endpoint when something is permanently wrong (bad credentials, 2FA
+    still on, the user doesn't exist, etc.)."""
+    if state.client is not None and state.client.bootstrap is not None:
+        return
+
+    remaining = state.cooldown_remaining()
+    if remaining > 0:
+        raise RuntimeError(
+            f"Protect auth cooling down ({int(remaining)}s left): "
+            f"{state._last_failure_msg}"
+        )
+
     if state.client is None:
         await state.connect()
-        return
-    # Check that bootstrap is still populated. If update() has been stuck or
-    # the connection was torn down, re-run it.
-    if state.client.bootstrap is None:
+    else:
+        # Client exists but bootstrap is empty — re-run update()
         await state.client.update()
         state._refresh_camera_map()
 
