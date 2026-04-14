@@ -1,79 +1,123 @@
-# LPR Dashboard for UniFi Protect
+# LPR Vehicle Tracking Dashboard
 
-A small Flask app that pulls license-plate detection events from your UDM-SE /
-UNVR running UniFi Protect and shows a daily log of who came in, when they
-left, and how long they stayed. Known plates are mapped to names from a YAML
-file you control.
+A small FastAPI web app that shows which license plates have been seen by
+UniFi Protect cameras in the last 24 hours, with known plates mapped to
+names, and arrival / departure times per vehicle.
 
-## Setup
+Built on [uiprotect](https://github.com/uilibs/uiprotect) — the same Python
+library that powers the Home Assistant UniFi Protect integration. All the
+messy Protect API details (auth, bootstrap, websocket, firmware quirks) are
+handled upstream; this app just asks for events and renders them.
 
-1. **Get a Protect integration API key** — Open the Protect application →
-   gear icon → *Control Plane* → *Integrations* → create an API key. Save it.
-   This is the same "access token for Protect" you already have.
+## Requirements
 
-2. **Find your console's local IP** — Easiest is the IP of your UDM-SE on
-   your management VLAN. The cloud URL
-   `https://unifi.ui.com/consoles/.../unifi-api/protect` works too if you set
-   things up to talk to the cloud proxy, but local-LAN access is faster and
-   doesn't depend on Ubiquiti's cloud being up.
+- A UniFi Protect NVR running **version 6 or later** (UDM Pro / SE / Max,
+  UNVR, CloudKey Gen2+, etc.)
+- **Python 3.11+** on Linux. Windows is not supported by `uiprotect`; use
+  WSL or a Linux VM if you're developing on Windows.
+- A **local** Protect admin account (Ubiquiti SSO accounts do not work).
+  2FA must be disabled on this account.
+- At least one camera with License Plate Recognition enabled.
 
-3. **Configure**
+## Quick start (development, on your laptop or the park box)
 
-   ```bash
-   cp .env.example .env
-   cp known_plates.example.yaml known_plates.yaml
-   $EDITOR .env known_plates.yaml
-   ```
+```bash
+git clone https://github.com/StefanRu/LPR-vehicle-tracking-dashboard.git lpr
+cd lpr
 
-4. **Run it** — either with Docker Compose:
+python3 -m venv .venv
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install -r requirements.txt
 
-   ```bash
-   docker compose up -d --build
-   ```
+cp .env.example .env
+cp known_plates.example.yaml known_plates.yaml
+$EDITOR .env                 # fill in PROTECT_HOST, credentials, timezone
+$EDITOR known_plates.yaml    # your real plates
 
-   or directly:
+set -a && source .env && set +a
+.venv/bin/python app.py
+```
 
-   ```bash
-   pip install -r requirements.txt
-   set -a && source .env && set +a
-   python app.py
-   ```
+Then open <http://localhost:8080>.
 
-5. Open <http://localhost:8080>.
+## Creating the Protect user
 
-## Discovering camera IDs (for entry / exit direction)
+1. UniFi OS → **Admins & Users** → **Add Admin**
+2. Role: Limited Admin → at minimum, View access to UniFi Protect
+3. Username: `lpr-app`
+4. Password: a long random string (e.g.
+   `python -c 'import secrets; print(secrets.token_urlsafe(32))'`)
+5. Disable 2FA for this user
+6. Put the credentials in `.env`
 
-Hit `http://localhost:8080/api/cameras` once it's running — you'll get a JSON
-list of cameras with their Protect ids and names. Pick the ids of the cameras
-that face arriving cars and put them in `ENTRY_CAMERA_IDS`, and the ones that
-face leaving cars in `EXIT_CAMERA_IDS`.
+## Finding your camera IDs
 
-If you only have one camera covering both directions, leave both vars empty.
-The app will use a "first sighting today = arrival, last sighting = departure"
-heuristic, which is fine for a residential gate where cars don't typically
-re-enter several times a day.
+Once the app is running, hit `http://<host>:8080/api/cameras` — it returns
+a JSON array of `{id, name}` for every camera on the NVR. Copy the IDs of
+the cameras that watch arriving cars into `ENTRY_CAMERA_IDS` and the ones
+watching departing cars into `EXIT_CAMERA_IDS`, then restart the app.
 
-## Notes on the Protect API
+If you only have one camera covering both directions, leave both empty and
+the app will use a first-seen / last-seen heuristic.
 
-UniFi released an official integration API in Protect 5.3. It uses
-`X-API-KEY: <token>` and is mounted at `/proxy/protect/integration/v1`. There
-are still a few rough edges:
+## Production deployment
 
-- The list-events endpoint returns events but often without `metadata`, so the
-  app fetches each event by id to get the plate text. (The legacy
-  `/proxy/protect/api/events` endpoint, which the app also tries as a
-  fallback, returns the metadata in the list result on some firmwares.)
-- The integration WebSocket for events doesn't include the resolved plate
-  string at all, only that `licensePlate` was detected — which is why this app
-  polls every 30 seconds instead of subscribing to a WebSocket.
+See `PARK_SETUP.md` for the full Ubuntu Server + systemd + Tailscale runbook.
+Short version:
 
-If a future Protect release adds a clean WebSocket payload for LPR, the
-polling loop in `api/events` is the only thing that needs to change.
+```bash
+# after git pull on the server:
+cd /opt/lpr
+.venv/bin/pip install -r requirements.txt
+sudo systemctl restart lpr
+```
 
-## Files
+## Endpoints
 
-- `app.py` — Flask backend, Protect client, classification logic
-- `templates/index.html` — single-page dark-mode UI, polls `/api/events`
-- `known_plates.yaml` — your plate ↔ name map (edit-able without restart)
-- `.env` — config
-- `Dockerfile`, `docker-compose.yml` — containerisation
+| Path           | What                                                |
+|----------------|-----------------------------------------------------|
+| `/`            | The dashboard (auto-refreshes every 30 s)           |
+| `/api/events`  | JSON of the vehicle log for the lookback window     |
+| `/api/cameras` | JSON list of cameras — use for finding IDs          |
+| `/healthz`     | 200 if connected to Protect, 503 otherwise          |
+
+## How it works
+
+1. On startup, `uiprotect.ProtectApiClient.update()` logs in and loads the
+   bootstrap (cameras + NVR state). The app caches a `camera_id → name`
+   map from it.
+2. Every time `/api/events` is hit, the app calls
+   `client.get_events(start, end)` for the configured lookback window.
+3. It filters to events whose `smart_detect_types` contain
+   `LICENSE_PLATE`, pulls the plate string from
+   `event.metadata.license_plate.name`, normalises it (uppercase,
+   alphanumeric only), and looks it up in `known_plates.yaml`.
+4. Events are grouped by plate. Depending on whether you've configured
+   entry/exit cameras, arrival and departure are determined either by
+   which camera saw the plate, or by first/last sighting in the window.
+5. The frontend re-polls `/api/events` every 30 seconds.
+
+If the Protect connection drops, the app reconnects on the next
+`/api/events` request. No supervisor loop, no websocket plumbing in the
+app code — `uiprotect` handles it.
+
+## Why FastAPI + uiprotect and not Flask + requests
+
+An earlier version of this project rolled its own Protect client using
+`requests` and Flask. That works fine on firmwares where the legacy REST
+API is accessible, but:
+
+- Protect's API moves between firmware versions and the hand-rolled client
+  needed patching
+- No websocket means events take longer to appear
+- License plate metadata lives in different places in different firmware
+  versions
+
+`uiprotect` is maintained against the latest Protect firmware and handles
+all of that. Using an async library pulled FastAPI in as the logical web
+framework choice. The result is a smaller, easier-to-maintain codebase
+with fewer surprises when Ubiquiti ships a Protect update.
+
+## License
+
+MIT.

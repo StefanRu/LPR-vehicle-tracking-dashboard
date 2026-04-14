@@ -1,8 +1,9 @@
-# /data/known_plates.yaml
-# Map of license plate -> driver name. Plates are matched case-insensitively
-# and stripped of spaces/dashes, so "AB-123-CD", "ab 123 cd" and "AB123CD"
-# are all equivalent.
+# Map of license plate -> driver name.
+# Plates are matched case-insensitively and stripped of spaces, dashes and
+# any non-alphanumerics, so "AB-123-CD", "ab 123 cd" and "AB123CD" all match.
+#
+# Edits take effect on the next page refresh — no restart needed.
 
 AB123CD: Stefan
-EF456GH: Robin's mum
-XY789ZZ: Grandma
+EF456GH: Delivery van
+XY789ZZ: Cleaning service

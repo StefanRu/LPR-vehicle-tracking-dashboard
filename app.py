@@ -1,42 +1,68 @@
 """
-UniFi Protect LPR Dashboard
----------------------------
-A small Flask app that queries the UniFi Protect API for license-plate
-recognition (LPR) events and renders a daily log of vehicles "in / out",
-mapping known plates to names.
+LPR Vehicle Tracking Dashboard
+==============================
 
-Configuration via environment variables (see .env.example):
+A small FastAPI app that polls a UniFi Protect NVR for license-plate
+detection events and displays a daily log of vehicles arriving and leaving,
+with known plates mapped to names.
 
-    PROTECT_HOST            e.g. https://192.168.1.1   (your UDM-SE)
-    PROTECT_API_KEY         Protect integration API key ("access token")
-    PROTECT_VERIFY_TLS      "true" or "false"  (default false; UDM uses a self-signed cert)
-    ENTRY_CAMERA_IDS        comma-separated Protect camera ids that see cars COMING IN
-    EXIT_CAMERA_IDS         comma-separated Protect camera ids that see cars LEAVING
-                            (leave EXIT_CAMERA_IDS empty if you only have one camera;
-                            the app will use first-seen / last-seen heuristic)
+Built on the `uiprotect` library (the same client that powers the Home
+Assistant UniFi Protect integration), so Protect's API quirks, firmware
+changes, and auth flow are handled upstream — we just ask for events.
+
+Configuration (all via environment variables, typically loaded from .env):
+
+    PROTECT_HOST            UDM-SE hostname or IP, e.g. "192.168.0.1"
+                            (do NOT include "https://" or a port)
+    PROTECT_PORT            usually 443
+    PROTECT_USERNAME        a LOCAL Protect admin account (not an SSO account)
+    PROTECT_PASSWORD        its password — 2FA must be disabled on this account
+    PROTECT_VERIFY_SSL      "true" or "false" (default false — UDMs ship with
+                            a self-signed cert)
+
+    ENTRY_CAMERA_IDS        comma-separated Protect camera ids that see cars
+                            COMING IN. Optional.
+    EXIT_CAMERA_IDS         same, for cars LEAVING. Optional.
+                            If both are empty, the app uses a first-seen /
+                            last-seen heuristic on whatever camera fired.
+
     KNOWN_PLATES_FILE       path to a YAML file mapping plates to names
-                            (default: /data/known_plates.yaml)
-    LOOKBACK_HOURS          how far back to fetch events for "today" (default 24)
+                            (default: ./known_plates.yaml). Re-read on every
+                            request, so editing is instant — no restart.
+
+    LOOKBACK_HOURS          how far back to fetch events (default 24)
     TIMEZONE                IANA tz name for display, e.g. "Europe/Paris"
+    PORT                    HTTP port to listen on (default 8080)
+
+Run:
+    uvicorn app:app --host 0.0.0.0 --port 8080
+or:
+    python app.py
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import sys
-import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import requests
-import urllib3
 import yaml
-from flask import Flask, jsonify, render_template
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
-# UDM-SE uses a self-signed cert by default; suppress the noisy warning when
-# PROTECT_VERIFY_TLS is false.
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# uiprotect is async and pulls in its own aiohttp session
+from uiprotect import ProtectApiClient
+from uiprotect.data import EventType, SmartDetectObjectType
+from uiprotect.exceptions import NotAuthorized, NvrError
 
+# --------------------------------------------------------------------------- #
+# Logging
+# --------------------------------------------------------------------------- #
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s - %(message)s",
@@ -46,9 +72,11 @@ log = logging.getLogger("lpr")
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
-PROTECT_HOST = os.environ.get("PROTECT_HOST", "").rstrip("/")
-PROTECT_API_KEY = os.environ.get("PROTECT_API_KEY", "")
-PROTECT_VERIFY_TLS = os.environ.get("PROTECT_VERIFY_TLS", "false").lower() == "true"
+PROTECT_HOST = os.environ.get("PROTECT_HOST", "").strip()
+PROTECT_PORT = int(os.environ.get("PROTECT_PORT", "443"))
+PROTECT_USERNAME = os.environ.get("PROTECT_USERNAME", "").strip()
+PROTECT_PASSWORD = os.environ.get("PROTECT_PASSWORD", "")
+PROTECT_VERIFY_SSL = os.environ.get("PROTECT_VERIFY_SSL", "false").lower() == "true"
 
 ENTRY_CAMERA_IDS = {
     c.strip() for c in os.environ.get("ENTRY_CAMERA_IDS", "").split(",") if c.strip()
@@ -57,164 +85,180 @@ EXIT_CAMERA_IDS = {
     c.strip() for c in os.environ.get("EXIT_CAMERA_IDS", "").split(",") if c.strip()
 }
 
-KNOWN_PLATES_FILE = os.environ.get("KNOWN_PLATES_FILE", "/data/known_plates.yaml")
+KNOWN_PLATES_FILE = Path(
+    os.environ.get("KNOWN_PLATES_FILE", "./known_plates.yaml")
+).expanduser()
+
 LOOKBACK_HOURS = int(os.environ.get("LOOKBACK_HOURS", "24"))
 DISPLAY_TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Paris"))
+PORT = int(os.environ.get("PORT", "8080"))
 
-if not PROTECT_HOST or not PROTECT_API_KEY:
-    log.error("PROTECT_HOST and PROTECT_API_KEY must be set")
+# Strip accidental scheme from PROTECT_HOST — uiprotect wants just the host.
+if PROTECT_HOST.startswith(("http://", "https://")):
+    PROTECT_HOST = PROTECT_HOST.split("://", 1)[1]
+PROTECT_HOST = PROTECT_HOST.rstrip("/")
+
+if not PROTECT_HOST:
+    log.error("PROTECT_HOST must be set (e.g. 192.168.0.1)")
+    sys.exit(1)
+if not (PROTECT_USERNAME and PROTECT_PASSWORD):
+    log.error("PROTECT_USERNAME and PROTECT_PASSWORD must be set")
     sys.exit(1)
 
 
+# --------------------------------------------------------------------------- #
+# Helpers: known plates, plate normalisation
+# --------------------------------------------------------------------------- #
+def normalise_plate(plate: str) -> str:
+    """Upper-case, strip spaces / dashes. Done consistently everywhere so a
+    user can write 'AB-123-CD' in the YAML and match 'ab 123 cd' from Protect."""
+    return "".join(ch for ch in plate.upper() if ch.isalnum())
+
+
 def load_known_plates() -> dict[str, str]:
-    """Load the {plate: name} map. Re-read on every request so editing the file
-    doesn't require a restart."""
+    """Load {plate: name}. Re-read every request so edits are instant.
+    Never raises — returns an empty dict on any error."""
     try:
-        with open(KNOWN_PLATES_FILE, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        # normalise plates to upper-case, no spaces
-        return {
-            str(k).upper().replace(" ", "").replace("-", ""): str(v)
-            for k, v in data.items()
-        }
+        with KNOWN_PLATES_FILE.open("r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        return {normalise_plate(str(k)): str(v) for k, v in raw.items()}
     except FileNotFoundError:
         log.warning("known_plates file %s not found", KNOWN_PLATES_FILE)
         return {}
-    except Exception as e:
-        log.exception("failed to load known plates: %s", e)
+    except Exception:
+        log.exception("failed to load known plates")
         return {}
 
 
-def normalise_plate(plate: str) -> str:
-    return plate.upper().replace(" ", "").replace("-", "")
-
-
 # --------------------------------------------------------------------------- #
-# UniFi Protect client
+# Protect client lifecycle
 # --------------------------------------------------------------------------- #
-class ProtectClient:
-    """Minimal client for the UniFi Protect integration API.
+#
+# `uiprotect` expects a single long-lived ProtectApiClient. We create it once
+# at app startup, keep it alive for the lifetime of the FastAPI process, and
+# close it on shutdown. `update()` loads the bootstrap (cameras + NVR info)
+# and opens the Protect websocket — even though we don't use the websocket
+# for event delivery, it keeps the session warm so subsequent REST calls
+# don't re-authenticate every 30 seconds.
+#
+# State is stashed on `app.state` so the request handlers can reach it.
+# --------------------------------------------------------------------------- #
+class ProtectState:
+    """Small holder for the live Protect client + derived camera map."""
 
-    The integration API (released in Protect 5.3) uses the header
-    `X-API-KEY: <token>` and is rooted at /proxy/protect/integration/v1.
+    def __init__(self) -> None:
+        self.client: ProtectApiClient | None = None
+        self.camera_names: dict[str, str] = {}
 
-    We also fall back to the legacy /proxy/protect/api/events endpoint for
-    the same token, because some Protect firmwares expose richer event
-    metadata there. If the legacy endpoint rejects the key, the app still
-    works with whatever the integration endpoint returns.
-    """
-
-    def __init__(self, host: str, api_key: str, verify: bool = False):
-        self.host = host
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "X-API-KEY": api_key,
-                "Accept": "application/json",
-            }
+    async def connect(self) -> None:
+        log.info("connecting to Protect at %s:%s as %s",
+                 PROTECT_HOST, PROTECT_PORT, PROTECT_USERNAME)
+        client = ProtectApiClient(
+            host=PROTECT_HOST,
+            port=PROTECT_PORT,
+            username=PROTECT_USERNAME,
+            password=PROTECT_PASSWORD,
+            verify_ssl=PROTECT_VERIFY_SSL,
         )
-        self.session.verify = verify
+        # update() logs in, fetches bootstrap, starts the websocket.
+        await client.update()
+        self.client = client
+        self._refresh_camera_map()
+        log.info("connected; %d cameras in bootstrap", len(self.camera_names))
 
-    def _get(self, path: str, **params) -> Any:
-        url = f"{self.host}{path}"
-        r = self.session.get(url, params=params, timeout=15)
-        if r.status_code >= 400:
-            log.warning("GET %s -> %s: %s", url, r.status_code, r.text[:300])
-        r.raise_for_status()
-        return r.json()
+    def _refresh_camera_map(self) -> None:
+        if self.client and self.client.bootstrap:
+            self.camera_names = {
+                cam.id: cam.name or cam.id
+                for cam in self.client.bootstrap.cameras.values()
+            }
 
-    def list_cameras(self) -> list[dict]:
-        """Return the list of cameras. Useful for discovering camera ids."""
-        try:
-            return self._get("/proxy/protect/integration/v1/cameras")
-        except Exception:
-            # Legacy shape: /proxy/protect/api/cameras exists but usually
-            # requires cookie auth; we swallow failures and return empty.
-            return []
-
-    def list_events(self, start_ms: int, end_ms: int) -> list[dict]:
-        """Return smart-detect events in the window [start_ms, end_ms].
-
-        Tries the integration endpoint first, then the legacy one. Both
-        return a list of event dicts; we only keep those that include
-        `licensePlate` in `smartDetectTypes`.
-        """
-        events: list[dict] = []
-
-        # ---- 1. Official integration API -------------------------------- #
-        try:
-            data = self._get(
-                "/proxy/protect/integration/v1/events",
-                start=start_ms,
-                end=end_ms,
-                # some firmwares accept a type filter; harmless if ignored
-                types="smartDetectZone,smartDetectLine",
-            )
-            if isinstance(data, list):
-                events = data
-        except Exception as e:
-            log.info("integration /events failed (%s); trying legacy", e)
-
-        # ---- 2. Legacy API (richer metadata on older firmwares) --------- #
-        if not events:
+    async def close(self) -> None:
+        if self.client is not None:
             try:
-                data = self._get(
-                    "/proxy/protect/api/events",
-                    start=start_ms,
-                    end=end_ms,
-                )
-                if isinstance(data, list):
-                    events = data
-            except Exception as e:
-                log.warning("legacy /events also failed: %s", e)
-
-        # Keep only LPR events
-        lpr_events = [
-            e
-            for e in events
-            if "licensePlate" in (e.get("smartDetectTypes") or [])
-        ]
-        return lpr_events
-
-    def get_event(self, event_id: str) -> dict | None:
-        """Fetch a single event by id (needed to get the plate text on the
-        integration API, which omits metadata in list results)."""
-        for path in (
-            f"/proxy/protect/integration/v1/events/{event_id}",
-            f"/proxy/protect/api/events/{event_id}",
-        ):
-            try:
-                return self._get(path)
+                await self.client.close_session()
             except Exception:
-                continue
+                log.exception("error closing Protect session")
+            self.client = None
+
+
+state = ProtectState()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Connect to Protect when the app starts, disconnect on shutdown.
+    If the initial connection fails we DON'T crash — we log and let the
+    /api/events endpoint surface the error. This matters for `systemctl
+    start lpr` when Protect happens to be momentarily unreachable."""
+    try:
+        await state.connect()
+    except Exception as e:
+        log.error("initial Protect connection failed: %s (will retry on request)", e)
+    yield
+    await state.close()
+
+
+app = FastAPI(title="LPR Dashboard", lifespan=lifespan)
+
+
+# --------------------------------------------------------------------------- #
+# Business logic: collapse raw events into one row per plate
+# --------------------------------------------------------------------------- #
+def extract_plate(event) -> str | None:
+    """Pull the plate string from a uiprotect Event.
+
+    The library exposes event.get_detected_thumbnail() which returns the
+    "best" EventDetectedThumbnail — the one marked clock_best_wall. On a
+    license-plate event, the plate string lives in:
+
+        thumbnail.group.matched_name      (preferred, UFP 6.x+)
+        thumbnail.name                    (fallback, some firmwares)
+
+    Return None if neither is populated (which happens: LPR is not always
+    confident enough to commit a plate string, even when the vehicle was
+    detected).
+    """
+    try:
+        thumb = event.get_detected_thumbnail()
+    except Exception:
+        thumb = None
+
+    # Fallback: walk detected_thumbnails directly if the helper didn't
+    # find one (e.g. none had clock_best_wall set).
+    if thumb is None:
+        md = getattr(event, "metadata", None)
+        thumbs = getattr(md, "detected_thumbnails", None) or []
+        for t in thumbs:
+            t_type = getattr(t, "type", None)
+            if hasattr(t_type, "value"):
+                t_type = t_type.value
+            if t_type == "licensePlate":
+                thumb = t
+                break
+
+    if thumb is None:
         return None
 
+    group = getattr(thumb, "group", None)
+    if group is not None:
+        matched = getattr(group, "matched_name", None)
+        if matched:
+            return normalise_plate(matched)
+        # Some firmwares put the raw plate in group.name instead
+        name = getattr(group, "name", None)
+        if name:
+            return normalise_plate(name)
 
-client = ProtectClient(PROTECT_HOST, PROTECT_API_KEY, PROTECT_VERIFY_TLS)
+    # Final fallback: the top-level thumbnail name field
+    name = getattr(thumb, "name", None)
+    if name:
+        return normalise_plate(name)
 
-
-# --------------------------------------------------------------------------- #
-# Business logic
-# --------------------------------------------------------------------------- #
-def extract_plate_text(event: dict) -> str | None:
-    """Pull the plate string out of an event, handling both the integration
-    and the legacy shapes."""
-    md = event.get("metadata") or {}
-    lp = md.get("licensePlate")
-    if isinstance(lp, dict) and lp.get("name"):
-        return normalise_plate(lp["name"])
-    # Some firmwares nest it under smartDetectEvents
-    for sd in event.get("smartDetectEvents") or []:
-        if sd.get("type") == "licensePlate" and sd.get("name"):
-            return normalise_plate(sd["name"])
-    # Top-level fallback
-    if event.get("licensePlate"):
-        return normalise_plate(event["licensePlate"])
     return None
 
 
 def classify_direction(camera_id: str) -> str:
-    """Return 'in', 'out' or 'unknown' based on which camera saw the plate."""
     if camera_id in ENTRY_CAMERA_IDS:
         return "in"
     if camera_id in EXIT_CAMERA_IDS:
@@ -222,23 +266,30 @@ def classify_direction(camera_id: str) -> str:
     return "unknown"
 
 
-def build_vehicle_log(events: list[dict], known: dict[str, str]) -> list[dict]:
-    """Collapse raw events into one row per plate with arrival and departure.
+def build_vehicle_log(events: list, known: dict[str, str]) -> list[dict]:
+    """Collapse raw events to one row per plate with arrival + departure.
 
-    Strategy:
-      * If we have camera-based direction (entry vs exit cams), use that.
-      * Otherwise fall back to: first sighting = arrival, last = departure,
-        but only if the span is > 60s (avoids flagging a single event as both).
+    Two modes, picked based on whether you've configured ENTRY/EXIT cameras:
+
+      * Camera-based: plate seen on an ENTRY_CAMERA → arrival,
+        on an EXIT_CAMERA → departure. Cleanest, requires two cameras.
+      * Heuristic: first sighting of a plate in the window = arrival,
+        last sighting = departure, only if >60s apart (so a single blip
+        doesn't count as both arrival and departure).
     """
     by_plate: dict[str, dict] = {}
+    has_direction_setup = bool(ENTRY_CAMERA_IDS or EXIT_CAMERA_IDS)
 
     for ev in events:
-        plate = extract_plate_text(ev)
+        plate = extract_plate(ev)
         if not plate:
             continue
-        ts_ms = ev.get("start") or ev.get("timestamp") or 0
-        cam = ev.get("device") or ev.get("camera") or ""
-        direction = classify_direction(cam)
+        cam_id = ev.camera_id or ""
+        cam_name = state.camera_names.get(cam_id, cam_id or "unknown")
+        ts = ev.start  # tz-aware datetime from uiprotect
+        if ts is None:
+            continue
+        ts_ms = int(ts.timestamp() * 1000)
 
         row = by_plate.setdefault(
             plate,
@@ -255,34 +306,38 @@ def build_vehicle_log(events: list[dict], known: dict[str, str]) -> list[dict]:
         )
         row["sightings"] += 1
 
-        if direction == "in":
-            if row["arrived_at"] is None or ts_ms < row["arrived_at"]:
-                row["arrived_at"] = ts_ms
-                row["arrival_camera"] = cam
-        elif direction == "out":
-            if row["left_at"] is None or ts_ms > row["left_at"]:
-                row["left_at"] = ts_ms
-                row["exit_camera"] = cam
-        else:
-            # Unknown direction: treat first as arrival, later as departure
-            if row["arrived_at"] is None or ts_ms < row["arrived_at"]:
-                row["arrived_at"] = ts_ms
-                row["arrival_camera"] = cam
-            if row["left_at"] is None or ts_ms > row["left_at"]:
-                # only count as a distinct departure if > 60s later
-                if row["arrived_at"] and ts_ms - row["arrived_at"] > 60_000:
+        if has_direction_setup:
+            direction = classify_direction(cam_id)
+            if direction == "in":
+                if row["arrived_at"] is None or ts_ms < row["arrived_at"]:
+                    row["arrived_at"] = ts_ms
+                    row["arrival_camera"] = cam_name
+            elif direction == "out":
+                if row["left_at"] is None or ts_ms > row["left_at"]:
                     row["left_at"] = ts_ms
-                    row["exit_camera"] = cam
+                    row["exit_camera"] = cam_name
+            # unknown-direction cameras are ignored in this mode
+        else:
+            # heuristic: any camera counts; first = arrival, last = departure
+            if row["arrived_at"] is None or ts_ms < row["arrived_at"]:
+                row["arrived_at"] = ts_ms
+                row["arrival_camera"] = cam_name
+            # departure only if far enough from arrival
+            if (
+                row["arrived_at"]
+                and ts_ms - row["arrived_at"] > 60_000
+                and (row["left_at"] is None or ts_ms > row["left_at"])
+            ):
+                row["left_at"] = ts_ms
+                row["exit_camera"] = cam_name
 
     rows = list(by_plate.values())
-    # Sort: still-present first (arrived but not left), then by arrival desc
-    rows.sort(
-        key=lambda r: (r["left_at"] is not None, -(r["arrived_at"] or 0))
-    )
+    # still-on-site (no departure) first, then most-recently-arrived first
+    rows.sort(key=lambda r: (r["left_at"] is not None, -(r["arrived_at"] or 0)))
     return rows
 
 
-def format_row_for_display(row: dict) -> dict:
+def format_row(row: dict) -> dict:
     def fmt(ms: int | None) -> str | None:
         if not ms:
             return None
@@ -295,7 +350,6 @@ def format_row_for_display(row: dict) -> dict:
     out = dict(row)
     out["arrived_at_str"] = fmt(row["arrived_at"])
     out["left_at_str"] = fmt(row["left_at"])
-    # Duration on site (if both known)
     if row["arrived_at"] and row["left_at"]:
         dur_s = (row["left_at"] - row["arrived_at"]) / 1000
         h, rem = divmod(int(dur_s), 3600)
@@ -308,58 +362,246 @@ def format_row_for_display(row: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# Flask app
+# Connection resilience
 # --------------------------------------------------------------------------- #
-app = Flask(__name__)
+async def ensure_connected() -> None:
+    """If the initial connect failed or the session was lost, reconnect.
+    Called at the start of every event-fetching request."""
+    if state.client is None:
+        await state.connect()
+        return
+    # Check that bootstrap is still populated. If update() has been stuck or
+    # the connection was torn down, re-run it.
+    if state.client.bootstrap is None:
+        await state.client.update()
+        state._refresh_camera_map()
 
 
-@app.route("/")
-def index():
-    return render_template("index.html")
+async def fetch_lpr_events(hours: int) -> list:
+    """Fetch smart-detect LPR events from the last `hours` hours.
+
+    We ask Protect to filter server-side by passing both `types` (we only
+    want smart-detect) and `smart_detect_types` (only license plate). This
+    is much cheaper than fetching everything and filtering in Python.
+
+    `descriptions=True` is the library default and is what populates
+    `event.metadata.detected_thumbnails` — don't set it to False or the
+    plate text will be missing.
+    """
+    assert state.client is not None
+    end = datetime.now(tz=timezone.utc)
+    start = end - timedelta(hours=hours)
+    events = await state.client.get_events(
+        start=start,
+        end=end,
+        limit=2000,
+        types=[EventType.SMART_DETECT],
+        smart_detect_types=[SmartDetectObjectType.LICENSE_PLATE],
+    )
+    return events
 
 
-@app.route("/api/events")
-def api_events():
-    known = load_known_plates()
-    now = datetime.now(tz=timezone.utc)
-    start = now - timedelta(hours=LOOKBACK_HOURS)
-    start_ms = int(start.timestamp() * 1000)
-    end_ms = int(now.timestamp() * 1000)
-
-    raw = client.list_events(start_ms, end_ms)
-
-    # On the integration API, list results often omit metadata. Fetch details
-    # for any event missing a plate text.
-    enriched = []
-    for ev in raw:
-        if not extract_plate_text(ev):
-            detail = client.get_event(ev["id"]) if ev.get("id") else None
-            if detail:
-                ev = {**ev, **detail}
-        enriched.append(ev)
-
-    rows = build_vehicle_log(enriched, known)
-    rows = [format_row_for_display(r) for r in rows]
-
-    return jsonify(
-        {
-            "generated_at": now.astimezone(DISPLAY_TZ).isoformat(timespec="seconds"),
-            "lookback_hours": LOOKBACK_HOURS,
-            "known_plate_count": len(known),
-            "raw_event_count": len(raw),
-            "vehicles": rows,
+# --------------------------------------------------------------------------- #
+# HTTP routes
+# --------------------------------------------------------------------------- #
+INDEX_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>LPR Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --bg: #0f1115; --panel: #181b22; --border: #262a33;
+      --text: #e6e8eb; --muted: #8a93a0; --accent: #4cc38a;
+      --warn: #e5a03a; --unknown: #777; --error: #e36363;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg); color: var(--text);
+    }
+    header {
+      padding: 1.5rem 2rem 1rem;
+      border-bottom: 1px solid var(--border);
+      display: flex; justify-content: space-between;
+      align-items: baseline; flex-wrap: wrap; gap: 1rem;
+    }
+    header h1 { margin: 0; font-size: 1.4rem; font-weight: 600; }
+    header .meta { color: var(--muted); font-size: 0.85rem; }
+    main { padding: 1.5rem 2rem; }
+    table {
+      width: 100%; border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+    }
+    th, td {
+      padding: 0.75rem 1rem; text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em;
+      color: var(--muted); font-weight: 600; background: #13161c;
+    }
+    tr:last-child td { border-bottom: none; }
+    .plate {
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-weight: 700; letter-spacing: 0.05em;
+      background: #222733; padding: 0.2rem 0.5rem;
+      border-radius: 4px; display: inline-block;
+    }
+    .plate.known { background: #1d3a2a; color: var(--accent); }
+    .name { color: var(--accent); font-weight: 500; }
+    .name.unknown { color: var(--unknown); font-style: italic; }
+    .status.on-site { color: var(--accent); }
+    .status.left { color: var(--muted); }
+    .empty { text-align: center; color: var(--muted); padding: 2rem; }
+    .error { text-align: center; color: var(--error); padding: 2rem; }
+    .dash { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>License plate activity</h1>
+    <div class="meta">
+      <span id="generated">loading…</span> &middot;
+      <span id="counts"></span>
+    </div>
+  </header>
+  <main>
+    <table>
+      <thead>
+        <tr>
+          <th>Plate</th><th>Name</th><th>Arrived</th><th>Left</th>
+          <th>Duration</th><th>Status</th><th>Sightings</th>
+        </tr>
+      </thead>
+      <tbody id="rows">
+        <tr><td colspan="7" class="empty">Loading…</td></tr>
+      </tbody>
+    </table>
+  </main>
+  <script>
+    async function refresh() {
+      try {
+        const r = await fetch("/api/events");
+        const data = await r.json();
+        if (data.error) {
+          document.getElementById("rows").innerHTML =
+            `<tr><td colspan="7" class="error">Error: ${data.error}</td></tr>`;
+          document.getElementById("generated").textContent = "error";
+          return;
         }
+        document.getElementById("generated").textContent =
+          "updated " + new Date(data.generated_at).toLocaleTimeString();
+        document.getElementById("counts").textContent =
+          `${data.vehicles.length} vehicles · ${data.raw_event_count} raw events · ${data.known_plate_count} known plates · last ${data.lookback_hours}h`;
+
+        const tbody = document.getElementById("rows");
+        if (!data.vehicles.length) {
+          tbody.innerHTML = '<tr><td colspan="7" class="empty">No license plate events in this window.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.vehicles.map(v => `
+          <tr>
+            <td><span class="plate ${v.known ? 'known' : ''}">${v.plate}</span></td>
+            <td class="name ${v.known ? '' : 'unknown'}">${v.name || 'unknown'}</td>
+            <td>${v.arrived_at_str || '<span class="dash">—</span>'}</td>
+            <td>${v.left_at_str || '<span class="dash">—</span>'}</td>
+            <td>${v.duration_str || '<span class="dash">—</span>'}</td>
+            <td class="status ${v.status === 'on site' ? 'on-site' : 'left'}">${v.status}</td>
+            <td>${v.sightings}</td>
+          </tr>
+        `).join("");
+      } catch (e) {
+        document.getElementById("rows").innerHTML =
+          `<tr><td colspan="7" class="error">Error: ${e.message}</td></tr>`;
+      }
+    }
+    refresh();
+    setInterval(refresh, 30000);
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index() -> HTMLResponse:
+    return HTMLResponse(INDEX_HTML)
+
+
+@app.get("/healthz")
+async def healthz():
+    """Liveness probe for monitoring.
+    Returns 200 if Protect is reachable and bootstrap is loaded."""
+    ok = state.client is not None and state.client.bootstrap is not None
+    return JSONResponse(
+        {"ok": ok, "cameras": len(state.camera_names)},
+        status_code=200 if ok else 503,
     )
 
 
-@app.route("/api/cameras")
-def api_cameras():
-    """Helper: list cameras + ids, so you can fill ENTRY_CAMERA_IDS / EXIT_CAMERA_IDS."""
-    cams = client.list_cameras()
-    return jsonify(
-        [{"id": c.get("id"), "name": c.get("name"), "type": c.get("type")} for c in cams]
-    )
+@app.get("/api/cameras")
+async def api_cameras():
+    """Helper: returns id + name of every camera in the Protect bootstrap.
+    Use this to find the camera ids to put in ENTRY_CAMERA_IDS / EXIT_CAMERA_IDS."""
+    try:
+        await ensure_connected()
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=503)
+    return [
+        {"id": cam_id, "name": name}
+        for cam_id, name in sorted(
+            state.camera_names.items(), key=lambda kv: kv[1].lower()
+        )
+    ]
 
 
+@app.get("/api/events")
+async def api_events():
+    """Main endpoint: returns the vehicle activity log for the configured
+    lookback window. Never raises; errors come back in the JSON body."""
+    try:
+        await ensure_connected()
+    except NotAuthorized as e:
+        log.error("Protect auth failed: %s", e)
+        return JSONResponse(
+            {"error": f"authentication failed: {e}"}, status_code=200
+        )
+    except NvrError as e:
+        log.error("Protect unreachable: %s", e)
+        return JSONResponse(
+            {"error": f"protect unreachable: {e}"}, status_code=200
+        )
+    except Exception as e:
+        log.exception("unexpected connection error")
+        return JSONResponse({"error": str(e)}, status_code=200)
+
+    try:
+        raw = await fetch_lpr_events(LOOKBACK_HOURS)
+    except Exception as e:
+        log.exception("fetching events failed")
+        return JSONResponse({"error": str(e)}, status_code=200)
+
+    known = load_known_plates()
+    rows = [format_row(r) for r in build_vehicle_log(raw, known)]
+
+    now = datetime.now(tz=timezone.utc).astimezone(DISPLAY_TZ)
+    return {
+        "generated_at": now.isoformat(timespec="seconds"),
+        "lookback_hours": LOOKBACK_HOURS,
+        "known_plate_count": len(known),
+        "raw_event_count": len(raw),
+        "vehicles": rows,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Entry point for `python app.py` (systemd will use uvicorn/gunicorn directly)
+# --------------------------------------------------------------------------- #
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
